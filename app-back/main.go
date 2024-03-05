@@ -1,64 +1,117 @@
 package main
 
 import (
-    "encoding/json"
     "fmt"
+    "io"
     "log"
     "net/http"
+    "os"
+    "path/filepath"
+    "strings"
+
+    "github.com/stacktitan/smb/smb"
+    "go.mongodb.org/mongo-driver/mongo"
+    "go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// Book representa la estructura de un libro
-type Book struct {
-    ID    string `json:"id"`
-    Title string `json:"title"`
-    Author string `json:"author"`
-    ISBN string `json:"isbn"`
-}
-
-var books []Book
-
-// handleAddBook maneja la solicitud para agregar un nuevo libro
-func handleAddBook(w http.ResponseWriter, r *http.Request) {
-    var book Book
-    err := json.NewDecoder(r.Body).Decode(&book)
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+    // ParseMultipartForm analiza una solicitud multipart y
+    // carga hasta maxMemory bytes en la memoria y el resto en un archivo temporal.
+    err := r.ParseMultipartForm(10 << 20) // 10 MB máximo
     if err != nil {
-        http.Error(w, err.Error(), http.StatusBadRequest)
+        http.Error(w, err.Error(), http.StatusInternalServerError)
         return
     }
 
-    books = append(books, book)
-    fmt.Fprintf(w, "Libro '%s' agregado correctamente", book.Title)
-}
+    // obtén el archivo del campo 'file' del formulario
+    file, handler, err := r.FormFile("file")
+    if err != nil {
+        http.Error(w, "Error al obtener el archivo del formulario", http.StatusBadRequest)
+        return
+    }
+    defer file.Close()
 
-// handleListBooks maneja la solicitud para listar todos los libros
-func handleListBooks(w http.ResponseWriter, r *http.Request) {
-    json.NewEncoder(w).Encode(books)
-}
+    // Creamos un archivo temporal para guardar el archivo
+    tempFile, err := os.CreateTemp("./uploads", "upload-*.tmp")
+    if err != nil {
+        http.Error(w, "Error al crear el archivo temporal", http.StatusInternalServerError)
+        return
+    }
+    defer tempFile.Close()
 
-// handleHealthCheck maneja la solicitud de comprobación de salud del sistema
-func handleHealthCheck(w http.ResponseWriter, r *http.Request) {
-    fmt.Fprintf(w, "Sistema en funcionamiento")
-}
-func handleReadBook(w http.ResponseWriter, r *http.Request){
+    // Copiamos el contenido del archivo recibido al archivo temporal
+    _, err = io.Copy(tempFile, file)
+    if err != nil {
+        http.Error(w, "Error al copiar el contenido del archivo", http.StatusInternalServerError)
+        return
+    }
 
-}
-func handleUpdate(w http.ResponseWriter, r *http.Request){
+    // Obtenemos la extensión del archivo
+    ext := filepath.Ext(handler.Filename)
 
-}
-func handleDelete(w http.ResponseWriter, r *http.Request){
+    // Establecemos la conexión a la base de datos MongoDB
+    clientOptions := options.Client().ApplyURI("mongodb://localhost:27017")
+    client, err := mongo.Connect(r.Context(), clientOptions)
+    if err != nil {
+        http.Error(w, "Error al conectar con la base de datos MongoDB", http.StatusInternalServerError)
+        return
+    }
+    defer client.Disconnect(r.Context())
 
+    // Obtenemos la colección
+    collection := client.Database("test").Collection("files")
+
+    // Creamos un registro para guardar en MongoDB
+    document := bson.M{
+        "filename": handler.Filename,
+        "size":     handler.Size,
+        "extension": ext,
+    }
+
+    // Insertamos el registro en MongoDB
+    _, err = collection.InsertOne(r.Context(), document)
+    if err != nil {
+        http.Error(w, "Error al insertar el registro en la base de datos MongoDB", http.StatusInternalServerError)
+        return
+    }
+
+    // Conexión al recurso compartido SAMBA
+    options := smb.Options{
+        Host:        "192.168.1.100",
+        User:        "tu_usuario",
+        Password:    "tu_contraseña",
+        Share:       "nombre_del_recurso_compartido",
+        Domain:      "",
+        EncryptData: true,
+    }
+    err = options.Connect()
+    if err != nil {
+        http.Error(w, "Error al conectar con el recurso compartido SAMBA", http.StatusInternalServerError)
+        return
+    }
+    defer options.Close()
+
+    // Subimos el archivo a SAMBA
+    sambaFilePath := "/carpeta_en_samba/" + handler.Filename
+    sambaFile, err := options.Create(sambaFilePath)
+    if err != nil {
+        http.Error(w, "Error al crear el archivo en SAMBA", http.StatusInternalServerError)
+        return
+    }
+    defer sambaFile.Close()
+
+    // Copiamos el contenido del archivo temporal al archivo en SAMBA
+    tempFile.Seek(0, 0)
+    _, err = io.Copy(sambaFile, tempFile)
+    if err != nil {
+        http.Error(w, "Error al copiar el contenido del archivo a SAMBA", http.StatusInternalServerError)
+        return
+    }
+
+    fmt.Fprintf(w, "Archivo subido con éxito a SAMBA y metadatos guardados en MongoDB.")
 }
 
 func main() {
-    // Endpoints
-    http.HandleFunc("/add_book", handleAddBook)
-    http.HandleFunc("/list_books", handleListBooks)
-    http.HandleFunc("/health", handleHealthCheck)
-    http.HandleFunc("/read",handleReadBook)
-    http.HandleFunc("/update",handleUpdate)
-    http.HandleFunc("/Delete",hanbleDelete)
-
-    // Servidor
-    fmt.Println("Servidor en funcionamiento en el puerto :8080")
+    http.HandleFunc("/upload", uploadHandler)
     log.Fatal(http.ListenAndServe(":8080", nil))
 }
